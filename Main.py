@@ -2,105 +2,130 @@ import os
 import random
 import argparse
 import requests
-from PIL import Image
+from PIL import Image, ImageDraw
 import base64
 from io import BytesIO
-from math import ceil
+import itertools
 
 API_URL = "http://127.0.0.1:7860/sdapi/v1/img2img"
 
-def encode_image(image_path):
-    with Image.open(image_path) as img:
-        buffered = BytesIO()
-        img.save(buffered, format="PNG")
-        return base64.b64encode(buffered.getvalue()).decode()
+def encode_image(image: Image.Image) -> str:
+    buffered = BytesIO()
+    image.save(buffered, format="PNG")
+    return base64.b64encode(buffered.getvalue()).decode()
 
 def load_prompts(prompt_file):
     if not os.path.exists(prompt_file):
         return []
     with open(prompt_file, 'r', encoding='utf-8') as f:
-        return [p.strip() for p in f.read().split(',') if p.strip()]
+        return [p.strip() for p in f.read().splitlines() if p.strip()]
 
-def distribute_counts(total, num_items):
-    per_item = total // num_items
-    remainder = total % num_items
-    counts = [per_item] * num_items
-    for i in range(remainder):
-        counts[i] += 1
-    return counts
+def create_mask(image: Image.Image, prompt: str = "") -> (Image.Image, tuple):
+    width, height = image.size
+    mask = Image.new("L", (width, height), 0)
+    draw = ImageDraw.Draw(mask)
+    square_size = int(min(width, height) / 2)
+    x0 = random.randint(0, width - square_size)
+    y0 = random.randint(0, height - square_size)
+    x1 = x0 + square_size
+    y1 = y0 + square_size
+    draw.rectangle([x0, y0, x1, y1], fill=255)
+    # YOLO format: class center_x center_y width height (tümü normalize)
+    center_x = (x0 + x1) / 2 / width
+    center_y = (y0 + y1) / 2 / height
+    norm_width = square_size / width
+    norm_height = square_size / height
+    yolo_box = (0, center_x, center_y, norm_width, norm_height)
+    return mask, yolo_box
+
+def send_to_api(init_img, control_img, mask_img, prompt, negative_prompt):
+    payload = {
+        "init_images": [encode_image(init_img)],
+        "mask": encode_image(mask_img),
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "denoising_strength": 0.45,
+        "inpainting_fill": 1,
+        "inpaint_full_res": True,
+        "inpaint_full_res_padding": 32,
+        "sampler_name": "Euler",
+        "steps": 20,
+        "cfg_scale": 7,
+        "width": init_img.size[0],
+        "height": init_img.size[1],
+        "controlnet_units": [{
+            "input_image": encode_image(control_img),
+            "module": "lineart",
+            "model": "control_v11p_sd15_lineart [43d4be0d]",
+            "weight": 1,
+            "resize_mode": 1,
+            "low_vram": True,
+            "guess_mode": False,
+            "control_mode": 0,
+            "conditioning_scale": 1.0
+        }]
+    }
+
+    response = requests.post(API_URL, json=payload)
+    if response.status_code == 200:
+        result = response.json()
+        img_data = result['images'][0]
+        if "," in img_data:
+            img_base64 = img_data.split(",", 1)[1]
+        else:
+            img_base64 = img_data
+        return Image.open(BytesIO(base64.b64decode(img_base64)))
+    else:
+        print(f"[!] Error {response.status_code}: {response.text}")
+        return None
 
 def main():
-    # Stil seçeneklerini burada tanımlayın
-    style_choices = ['realistic', 'Cinematic', 'Photographic', 'abstract', 'cyberpunk']
-
     parser = argparse.ArgumentParser()
     parser.add_argument('-c', '--count', type=int, required=True, help='Toplam üretilecek resim sayısı')
-    parser.add_argument('-bs', '--batch_size', dest='batch_size', type=int, default=1, help='Batch size')
-    parser.add_argument('-bc', '--batch_count', dest='batch_count', type=int, default=1, help='Batch count')
+    parser.add_argument('-bs', '--batch_size', type=int, default=1, help='Batch size')
+    parser.add_argument('-bc', '--batch_count', type=int, default=1, help='Batch count')
     parser.add_argument('-p', '--prompt_file', type=str, default='prompt.txt', help='Prompt dosyası (virgülle ayrılmış)')
     parser.add_argument('-np', '--neg_prompt_file', type=str, default='negative_prompt.txt', help='Negative prompt dosyası')
     parser.add_argument('-o', '--output_dir', type=str, default='output', help='Çıktı klasörü')
     parser.add_argument('-i', '--input_dir', type=str, default='input', help='Giriş görselleri klasörü')
-    parser.add_argument('--style', choices=style_choices, nargs='+', default=['Cinematic'], help="Bir veya daha fazla stil türü seçin")
-
+    parser.add_argument('-ci', '--control_dir', type=str, default='control', help='Control görselleri klasörü')
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
-
     prompts = load_prompts(args.prompt_file)
-    neg_prompts = load_prompts(args.neg_prompt_file)
-    images = [os.path.join(args.input_dir, f) for f in os.listdir(args.input_dir)
-              if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-
-    if not images:
-        print("Input klasöründe görsel bulunamadı.")
+    negative_prompts = load_prompts(args.neg_prompt_file)
+    
+    images = [img for img in os.listdir(args.input_dir) if img.lower().endswith(('png', 'jpg', 'jpeg'))]
+    if len(images) == 0:
+        print("Giriş klasöründe görsel bulunamadı.")
         return
 
-    if not prompts:
-        print("Prompt dosyasında içerik bulunamadı.")
+    control_images = [img for img in os.listdir(args.control_dir) if img.lower().endswith(('png', 'jpg', 'jpeg'))]
+    if len(control_images) == 0:
+        print("Control klasöründe görsel bulunamadı.")
         return
 
-    counts = distribute_counts(args.count, len(images))
-
-    for img_path, count in zip(images, counts):
-        img_name = os.path.splitext(os.path.basename(img_path))[0]
-        for i in range(count):
+    for i, image_name in enumerate(itertools.islice(itertools.cycle(images), args.count)):
+        image_path = os.path.join(args.input_dir, image_name)
+        with Image.open(image_path).convert("RGB") as init_img:
             prompt = random.choice(prompts)
-            neg_prompt = random.choice(neg_prompts) if neg_prompts else ""
-            
-            # Stil türlerini seçiyoruz
-            selected_styles = ", ".join(args.style)  # Seçilen stilleri birleştiriyoruz
+            neg_prompt = random.choice(negative_prompts) if negative_prompts else ""
+            mask, yolo_box = create_mask(init_img, prompt)
+            control_image_name = random.choice(control_images)
+            control_image_path = os.path.join(args.control_dir, control_image_name)
+            with Image.open(control_image_path).convert("RGB") as control_img:
+                output_img = send_to_api(init_img, control_img, mask, prompt, neg_prompt)
 
-            # Örneğin, prompt'u stil türlerine göre değiştirebiliriz
-            prompt = f"{prompt}, {selected_styles}"
+            if output_img:
+                output_path = os.path.join(args.output_dir, f"out_{i+1}.png")
+                output_img.save(output_path)
+                # Kaydedilen resmin yanına YOLO koordinatlarını içeren bir txt dosyası oluşturuluyor.
+                annotation_path = os.path.join(args.output_dir, f"out_{i+1}.txt")
+                with open(annotation_path, "w", encoding="utf-8") as f:
+                    f.write(" ".join(str(val) for val in yolo_box))
+                print(f"[✓] Kayıt edildi: {output_path} | Annotation: {annotation_path}")
+            else:
+                print(f"[✗] İşlenemedi: {image_name}")
 
-            payload = {
-                "init_images": [encode_image(img_path)],
-                "prompt": prompt,
-                "negative_prompt": neg_prompt,
-                "batch_size": args.batch_size,
-                "n_iter": args.batch_count,
-                "seed": -1,
-                "denoising_strength": 0.6,
-                "sampler_name": "DPM++ 2M Karras",
-                "cfg_scale": 7,
-                "steps": 30,
-                "width": 512,
-                "height": 512
-            }
-
-            try:
-                response = requests.post(API_URL, json=payload)
-                response.raise_for_status()
-                r = response.json()
-
-                for j, img_data in enumerate(r['images']):
-                    img_bytes = base64.b64decode(img_data.split(",", 1)[0] if "," in img_data else img_data)
-                    out_path = os.path.join(args.output_dir, f"{img_name}_{i}_{j}.png")
-                    with open(out_path, "wb") as f:
-                        f.write(img_bytes)
-                    print(f"✓ {out_path} kaydedildi.")
-            except Exception as e:
-                print(f"Hata oluştu: {e}")
 if __name__ == "__main__":
     main()
