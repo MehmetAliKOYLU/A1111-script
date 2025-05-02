@@ -20,23 +20,33 @@ def load_prompts(prompt_file):
     with open(prompt_file, 'r', encoding='utf-8') as f:
         return [p.strip() for p in f.read().splitlines() if p.strip()]
 
-def create_mask(image: Image.Image, prompt: str = "") -> (Image.Image, tuple):
+def create_mask(image: Image.Image, prompt: str = "") -> (Image.Image, tuple, tuple):
     width, height = image.size
+
+    # --- rastgele boyut sınırları ---
+    MIN_FRAC, MAX_FRAC = 0.20, 0.50          # %20‑%50 arası
+    box_w = random.randint(int(width  * MIN_FRAC), int(width  * MAX_FRAC))
+    box_h = random.randint(int(height * MIN_FRAC), int(height * MAX_FRAC))
+    # ---------------------------------
+
+    # Kutunun sol‑üst köşesini, kutu tamamen kadraj içinde kalacak şekilde seç
+    x0 = random.randint(0, width  - box_w)
+    y0 = random.randint(0, height - box_h)
+    x1, y1 = x0 + box_w, y0 + box_h
+
+    # Maske resmi
     mask = Image.new("L", (width, height), 0)
-    draw = ImageDraw.Draw(mask)
-    square_size = int(min(width, height) / 2)
-    x0 = random.randint(0, width - square_size)
-    y0 = random.randint(0, height - square_size)
-    x1 = x0 + square_size
-    y1 = y0 + square_size
-    draw.rectangle([x0, y0, x1, y1], fill=255)
-    # YOLO format: class center_x center_y width height (tümü normalize)
+    ImageDraw.Draw(mask).rectangle([x0, y0, x1, y1], fill=255)
+
+    # YOLO formatına dönüştür (class, cx, cy, w, h) — normalize
     center_x = (x0 + x1) / 2 / width
     center_y = (y0 + y1) / 2 / height
-    norm_width = square_size / width
-    norm_height = square_size / height
-    yolo_box = (0, center_x, center_y, norm_width, norm_height)
-    return mask, yolo_box
+    norm_w   = box_w / width
+    norm_h   = box_h / height
+    yolo_box = (0, center_x, center_y, norm_w, norm_h)
+
+    return mask, yolo_box, (x0, y0, x1, y1)
+
 
 def send_to_api(init_img, control_img, mask_img, prompt, negative_prompt):
     payload = {
@@ -51,8 +61,8 @@ def send_to_api(init_img, control_img, mask_img, prompt, negative_prompt):
         "sampler_name": "Euler",
         "steps": 20,
         "cfg_scale": 7,
-        "width": init_img.size[0],
-        "height": init_img.size[1],
+        "width": 640,
+        "height": 640,
         "controlnet_units": [{
             "input_image": encode_image(control_img),
             "module": "lineart",
@@ -110,16 +120,20 @@ def main():
         with Image.open(image_path).convert("RGB") as init_img:
             prompt = random.choice(prompts)
             neg_prompt = random.choice(negative_prompts) if negative_prompts else ""
-            mask, yolo_box = create_mask(init_img, prompt)
+            mask, yolo_box, box_coords = create_mask(init_img, prompt)
             control_image_name = random.choice(control_images)
             control_image_path = os.path.join(args.control_dir, control_image_name)
             with Image.open(control_image_path).convert("RGB") as control_img:
                 output_img = send_to_api(init_img, control_img, mask, prompt, neg_prompt)
 
             if output_img:
+                # Üretilen resmin üzerine kırmızı kutu çiziliyor.
+                #draw = ImageDraw.Draw(output_img)
+                #draw.rectangle(box_coords, outline="red", width=3)
+
                 output_path = os.path.join(args.output_dir, f"out_{i+1}.png")
                 output_img.save(output_path)
-                # Kaydedilen resmin yanına YOLO koordinatlarını içeren bir txt dosyası oluşturuluyor.
+                # Kayıt edilen resmin yanına YOLO koordinatlarını içeren txt dosyası oluşturuluyor.
                 annotation_path = os.path.join(args.output_dir, f"out_{i+1}.txt")
                 with open(annotation_path, "w", encoding="utf-8") as f:
                     f.write(" ".join(str(val) for val in yolo_box))
